@@ -35,6 +35,15 @@ const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
 const SETSTATE_RE = /this\.setState\s*\(/;
 const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)[\s/>]/g;
 const MAX_JSX_CHILDREN = 30;
+// Vue SFC templates: kebab-case child components (<el-button> → ElButton) and
+// event bindings (@click="fn" / v-on:click="fn"). PascalCase children (<VPNav/>)
+// are already caught by JSX_TAG_RE via the SFC component node.
+const VUE_KEBAB_RE = /<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)[\s/>]/g;
+const VUE_HANDLER_RE = /(?:@|v-on:)([a-zA-Z][\w-]*)(?:\.[\w]+)*\s*=\s*"([^"]+)"/g;
+
+function kebabToPascal(s: string): string {
+  return s.split('-').map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('');
+}
 
 function sliceLines(content: string, startLine?: number, endLine?: number): string | null {
   if (!startLine || !endLine) return null;
@@ -273,19 +282,75 @@ function reactJsxChildEdges(ctx: ResolutionContext): Edge[] {
 }
 
 /**
+ * Phase 6: Vue SFC templates. The `.vue` extractor only parses `<script>`, so
+ * template usage is invisible — child components and event handlers used ONLY in
+ * the template have no edge to them. PascalCase children (`<VPNav/>`) are already
+ * caught by reactJsxChildEdges (which scans the SFC component node), so this adds
+ * the two Vue-specific shapes:
+ *   - kebab-case children: `<el-button>` → `ElButton` component (renders).
+ *   - event bindings: `@click="onClick"` / `v-on:submit="save"` → handler method.
+ * Scoped to the `<template>` block of `.vue` files; resolution gate (kebab→
+ * component, handler→function/method) keeps precision; inline arrows / `$emit`
+ * skipped.
+ */
+function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const COMPONENT_KINDS = new Set(['component', 'function', 'class']);
+  const HANDLER_KINDS = new Set(['method', 'function']);
+  for (const file of ctx.getAllFiles()) {
+    if (!file.endsWith('.vue')) continue;
+    const content = ctx.readFile(file);
+    const tpl = content && content.match(/<template[^>]*>([\s\S]*)<\/template>/i)?.[1];
+    if (!tpl) continue;
+    const comp = ctx.getNodesInFile(file).find((n) => n.kind === 'component');
+    if (!comp) continue;
+    let added = 0;
+    const link = (name: string, kinds: Set<string>, meta: Record<string, unknown>) => {
+      if (added >= MAX_JSX_CHILDREN) return;
+      const matches = ctx.getNodesByName(name).filter((n) => kinds.has(n.kind));
+      // Prefer a target in THIS SFC (handlers are defined in the same file's
+      // script) — avoids cross-file mis-resolution when a name repeats across a
+      // monorepo (e.g. 7 code-login.vue each with handleLogin). Child components
+      // live in other files, so they fall back to the first match.
+      const target = matches.find((n) => n.filePath === file) ?? matches[0];
+      if (!target || target.id === comp.id) return;
+      const key = `${comp.id}>${target.id}>${meta.synthesizedBy}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      edges.push({ source: comp.id, target: target.id, kind: 'calls', line: comp.startLine, provenance: 'heuristic', metadata: meta });
+      added++;
+    };
+    let m: RegExpExecArray | null;
+    VUE_KEBAB_RE.lastIndex = 0;
+    while ((m = VUE_KEBAB_RE.exec(tpl))) link(kebabToPascal(m[1]!), COMPONENT_KINDS, { synthesizedBy: 'jsx-render', via: m[1] });
+    VUE_HANDLER_RE.lastIndex = 0;
+    while ((m = VUE_HANDLER_RE.exec(tpl))) {
+      const event = m[1]!;
+      const expr = m[2]!.trim();
+      if (expr.includes('=>') || expr.startsWith('$')) continue; // inline arrow / $emit
+      const name = expr.match(/^([A-Za-z_]\w*)/)?.[1];
+      if (name) link(name, HANDLER_KINDS, { synthesizedBy: 'vue-handler', event });
+    }
+  }
+  return edges;
+}
+
+/**
  * Synthesize dispatcher→callback edges (field observers + EventEmitters +
- * React re-render + JSX children). Returns the count added. Never throws into
- * indexing — callers wrap in try/catch.
+ * React re-render + JSX children + Vue templates). Returns the count added.
+ * Never throws into indexing — callers wrap in try/catch.
  */
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
   const fieldEdges = fieldChannelEdges(queries, ctx);
   const emitterEdges = eventEmitterEdges(ctx);
   const renderEdges = reactRenderEdges(queries, ctx);
   const jsxEdges = reactJsxChildEdges(ctx);
+  const vueEdges = vueTemplateEdges(ctx);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges]) {
+  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);

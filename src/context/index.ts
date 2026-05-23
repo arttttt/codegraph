@@ -348,6 +348,8 @@ export class ContextBuilder {
         ? `React re-render via setState${at}`
         : m.synthesizedBy === 'jsx-render'
         ? `renders <${String(m.via || 'child')}>`
+        : m.synthesizedBy === 'vue-handler'
+        ? `Vue @${String(m.event || 'event')} handler`
         : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
       synthByPair.set(`${e.source}>${e.target}`, label);
     }

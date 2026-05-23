@@ -1117,6 +1117,14 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'vue-handler') {
+      const ev = m.event ? `@${String(m.event)}` : 'a template event';
+      return {
+        label: `Vue template handler — bound to ${ev} (dynamic dispatch)`,
+        compact: `dynamic: Vue ${ev} handler`,
+        registeredAt,
+      };
+    }
     return null;
   }
 
