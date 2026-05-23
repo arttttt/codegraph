@@ -190,6 +190,7 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 | C# | ASP.NET Core | request → [Http*] action → DI service → EF | X | ✅ **feature-folder detection** (realworld 0→19 — was undetected) + **bare `[HttpGet]` + class `[Route]` prefix** (eShopOnWeb 9→33 / jellyfin L) — co-located so no claimsReference needed. 🔬 EF Core LINQ/DbSet (metaprogramming frontier) |
 | Ruby | Rails / Sinatra | request → routes.rb → Controller#action → model | R | ✅ **RESTful `resources`/`resource` routing → controller#action** (realworld S 16 / spree M / forem L), pluralization + only/except + claimsReference; explicit routes fixed to precise `controller#action` too. 🔬 ActiveRecord dynamic finders (`Article.find_by_slug`) — metaprogramming frontier |
 | PHP | Laravel | request → route → controller → Eloquent | R | ✅ **precise `Route::get([Ctrl::class,'m'])` / `'Ctrl@m'` → Ctrl@method** (realworld S / firefly M / bookstack L) — was resolving the bare method name to the WRONG controller (every `index`→ArticleController); Route::resource→controller. 🔬 Eloquent dynamic finders/relationships (metaprogramming frontier) |
+| PHP | Drupal | request → *.routing.yml → _controller/_form | R | ✅ **`claimsReference` for FQCN handlers** (`\Drupal\…\Class::method` passed the pre-filter only because the `::method` name was known; bare `_form` FQCNs `\…\FormClass` and single-colon `Class:method` controller-services were dropped before resolve()) + **single-colon controller match** + **detect via composer `type:drupal-*` / `name:drupal/*` + `*.info.yml` fallback** (a contrib module with empty `require` was undetected → 0 routes). admin_toolbar S **0→14 (14/14)** / webform M 208 (**144**) / core L 836 (536→**731, 87%**). Remainder is the **entity-annotation handler frontier** (`_entity_form: type.op` resolves via the entity's PHP `#[ContentEntityType]` handlers, not a direct class). 🔬 **OOP `#[Hook]` attributes** — Drupal 11 moved ~all procedural hooks to attribute methods (core: 418 `#[Hook]` files vs 3 procedural), so the resolver's docblock/`module_hook` detection is obsolete for modern core (0 hook edges) |
 | C/C++ | (callback structs / vtables) | function-pointer dispatch | ? | ⬜ |
 | Dart | Flutter | setState → build | S | ⬜ |
 | Lua / Luau | (Neovim / Roblox) | event/callback dispatch | S | ⬜ |
@@ -347,6 +348,28 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
   redash's React frontend (32 bogus `.js` "routes" from a JS resolver — unrelated to Python). **Lesson: the
   builtin-name filter is a silent precision tax across Python** — any view/function named `get`/`index`/`update`
   loses edges; the fix is general (helps Django/DRF handlers too), not Flask-specific.
+- **Drupal (validated 2026-05-23, admin_toolbar S / webform M / drupal-core L) — pre-filter + detection fixes.**
+  The `*.routing.yml` extractor and the `_controller`/`_form` resolver already existed but two gaps kept most
+  routes unlinked. (1) **The `claimsReference` pre-filter gotcha (again):** Drupal handler refs are FQCNs
+  (`\Drupal\…\Class::method`), bare form classes (`\…\SettingsForm`), or single-colon controller-services
+  (`\…\Controller:method`). Only the `::method` shape survived `resolveOne`'s pre-filter (its `member` is a
+  known method name); the bare-FQCN forms and single-colon controllers named no declared symbol and were
+  dropped before `resolve()` ran. Added `claimsReference` (FQCN / `Class:method` / `hook_*`) + a single-colon
+  branch in the controller regex → core **536→731 of 836 routes (87%)**; all three previously-broken shapes now
+  resolve (`/admin/content/comment`→CommentAdminOverview form, `/big_pipe/no-js`→setNoJsCookie controller).
+  (2) **Detection missed standalone contrib modules:** `detect()` only checked composer `require` for a
+  `drupal/*` dep, but a contrib module often has an EMPTY `require` and is identified only by
+  `"name":"drupal/<m>"` + `"type":"drupal-module"` (admin_toolbar → 0 routes). Broadened to composer name/type
+  + a `*.info.yml` fallback → admin_toolbar **0→14 (14/14)**. Canonical flow traverses (`getAnnouncements` ←
+  `/admin/announcements_feed`); node count unchanged (resolution-only). Agent A/B (dblog route→controller,
+  n=2/arm): codegraph **0 read / 1 grep / 20–22s** vs without **1 read / 2 grep + glob / 28–32s** — fewer
+  tools and faster on the ~10k-file core. **Residuals (frontier):**
+  entity-annotation handlers (`_entity_form: comment.default` → handler classes declared in the entity's
+  `#[ContentEntityType]` annotation, not a direct ref — ~78 of core's ~105 remaining unresolved) and **OOP
+  `#[Hook]` attributes** — Drupal 11 converted nearly all procedural hooks to `#[Hook('event')]` methods (core:
+  418 attribute files vs 3 procedural `*.module` hooks), so the resolver's procedural-hook detection (docblock
+  `@Implements` / `module_hook` naming) finds essentially nothing in modern core (0 hook edges). Both are real
+  follow-ups, not regressions.
 - **Difficulty gradient is real:** named-ref dispatch (resolver) is cheap; anonymous
   callback dispatch (synthesizer) is medium; **anonymous-arrow handlers are the hard
   remaining gap** (no identity → need synthesizer link-through-body, not yet built).
