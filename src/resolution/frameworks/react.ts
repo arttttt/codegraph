@@ -186,6 +186,47 @@ export const reactResolver: FrameworkResolver = {
       }
     }
 
+    // React Router data-router (v6.4+): createBrowserRouter([{ path, element }]).
+    // Only scan files that use the data-router API, then pull each route object's
+    // `path` + `element={<Comp/>}` / `Component: Comp` (a forward window confirms
+    // it's a route object, not a stray `path:` field).
+    if (/\b(?:createBrowserRouter|createHashRouter|createMemoryRouter|createRoutesFromElements)\b/.test(content)) {
+      const objPathRe = /\bpath\s*:\s*['"]([^'"]*)['"]/g;
+      let om: RegExpExecArray | null;
+      while ((om = objPathRe.exec(content)) !== null) {
+        const win = content.slice(om.index, om.index + 300);
+        const compMatch =
+          win.match(/\belement\s*:\s*<\s*([A-Z][A-Za-z0-9_]*)/) ||
+          win.match(/\bComponent\s*:\s*([A-Z][A-Za-z0-9_]*)/);
+        if (!compMatch) continue; // require a component → it's a real route object
+        const routePath = om[1] || '/';
+        const line = content.slice(0, om.index).split('\n').length;
+        const routeNode: Node = {
+          id: `route:${filePath}:${line}:${routePath}`,
+          kind: 'route',
+          name: routePath,
+          qualifiedName: `${filePath}::route:${routePath}`,
+          filePath,
+          startLine: line,
+          endLine: line,
+          startColumn: 0,
+          endColumn: 0,
+          language: filePath.endsWith('.tsx') ? 'tsx' : 'jsx',
+          updatedAt: now,
+        };
+        nodes.push(routeNode);
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: compMatch[1]!,
+          referenceKind: 'references',
+          line,
+          column: 0,
+          filePath,
+          language: filePath.endsWith('.tsx') ? 'tsx' : 'jsx',
+        });
+      }
+    }
+
     // Extract Next.js pages/routes (pages directory convention)
     if (filePath.includes('pages/') || filePath.includes('app/')) {
       // Default export in pages becomes a route
@@ -322,7 +363,17 @@ function filePathToRoute(filePath: string): string | null {
   // app/page.tsx -> /
   // app/about/page.tsx -> /about
 
-  if (filePath.includes('pages/')) {
+  // Only real page-component files are routes. Exclude non-page extensions
+  // (.mjs/.json/.cjs), config files (next.config.ts, vite.config.ts…), and
+  // Next.js special files (_app/_document). This also stops a `*.config.mjs`
+  // with `export default` in a dir like `nextjs-pages/` from being a "route".
+  const base = filePath.split('/').pop() ?? '';
+  if (!/\.(tsx?|jsx?)$/.test(base)) return null;
+  if (base.startsWith('_') || /\.config\.[a-z]+$/.test(base)) return null;
+
+  // Match pages/ and app/ as PATH SEGMENTS (not a substring — `nextjs-pages/`
+  // must not count as a `pages/` router dir).
+  if (/(?:^|\/)pages\//.test(filePath)) {
     let route = filePath
       .replace(/^.*pages\//, '/')
       .replace(/\/index\.(tsx?|jsx?)$/, '')
@@ -333,7 +384,7 @@ function filePathToRoute(filePath: string): string | null {
     return route;
   }
 
-  if (filePath.includes('app/')) {
+  if (/(?:^|\/)app\//.test(filePath)) {
     // App router - only page.tsx files are routes
     if (!filePath.includes('page.')) {
       return null;

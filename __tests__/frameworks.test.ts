@@ -1103,6 +1103,27 @@ describe('reactResolver.extract — React Router', () => {
     expect(routes).toHaveLength(1);
     expect(routes[0]?.name).toBe('/x');
   });
+
+  it('extracts createBrowserRouter object routes ({ path, element/Component })', () => {
+    const src = `const router = createBrowserRouter([
+      { path: "/dashboard", element: <Dashboard /> },
+      { path: "/login", Component: Login },
+    ]);`;
+    const { nodes, references } = reactResolver.extract!('router.tsx', src);
+    const routes = nodes.filter((n) => n.kind === 'route');
+    expect(routes.map((n) => n.name).sort()).toEqual(['/dashboard', '/login']);
+    expect(references.map((r) => r.referenceName).sort()).toEqual(['Dashboard', 'Login']);
+  });
+
+  it('does not treat config files or a nextjs-pages dir as Next.js routes', () => {
+    const cfg = reactResolver.extract!('apps/nextjs-pages/next.config.mjs', 'export default {}');
+    expect(cfg.nodes.filter((n) => n.kind === 'route')).toHaveLength(0);
+    const vite = reactResolver.extract!('src/pages/vite.config.ts', 'export default {}');
+    expect(vite.nodes.filter((n) => n.kind === 'route')).toHaveLength(0);
+    // a real page still works
+    const page = reactResolver.extract!('src/pages/about.tsx', 'export default function About(){return null}');
+    expect(page.nodes.filter((n) => n.kind === 'route').map((n) => n.name)).toEqual(['/about']);
+  });
 });
 
 describe('svelteResolver.extract (smoke)', () => {
