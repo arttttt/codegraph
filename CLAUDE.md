@@ -96,6 +96,20 @@ CodeGraph's core value is letting an agent answer **structural/flow** questions 
 
 **Target behavior:** a flow question resolves in **1 codegraph call on small repos, scaling to 3–5 on large**, with **Read/Grep = 0**. When reviewing a PR or trying something new, do not regress this.
 
+### Adapt the tool to the agent — don't try to change the agent
+
+The lever that decides whether a retrieval change lands. **Test before building anything here: does this make a tool the agent _already calls_ do more with the input it _already gives_? If it instead needs the agent to behave differently — pick a different tool, query differently, learn from examples — it hits the low-salience wall and won't land.**
+
+CodeGraph's only channels to influence the agent are low-salience: the MCP `initialize` instructions (`server-instructions.ts`) and the tool descriptions. Changing them does **not** reliably move the agent's tool _choice_ or query style — validated: trace-first steering ported into the server-instructions + tool descriptions (3 wording variants) never reproduced what a CLI `--append-system-prompt` achieved, and **regressed** wall-clock vs baseline. New tools fare worse (rarely chosen — the agent under-picks even `trace`); "better examples" is the same steering. The agent's tool-choice does improve on its own as host models get better at tool use — but that is not ours to force.
+
+What works is meeting the agent where it already is:
+- **Sufficiency** — `codegraph_trace` inlines each hop's body + the destination's own callees, so one trace call ends the flow investigation (no follow-up explore/node/Read).
+- **explore-flow** — `codegraph_explore`'s query is a precise bag of symbol names (incl. qualified `Class.method`) spanning the flow the agent is after; explore finds the call path _among those named symbols_ (riding synthesized edges) and leads its output with it — delivering trace-quality flow through the call the agent reliably makes. (`buildFlowFromNamedSymbols`: segment/co-naming disambiguation; ≤1 unnamed bridge so it never wanders a god-function's fan-out.)
+
+What fails is the inverse — folding a precise answer into a **fuzzy-input** tool. `codegraph_context` gets a description, not symbols, so it can't disambiguate a flow's endpoints and surfaces the _wrong feature_. Precise output needs precise input.
+
+The remaining lever under this axis is **coverage**: every flow made to connect statically (a new dynamic-dispatch synthesizer) is then surfaced automatically by explore-flow/`trace`, no agent change needed. Reactive/reconciler runtimes (Halo's `ReactiveExtensionClient`, MediatR, Vue Proxy) are the frontier — flows there have no static edges, so nothing surfaces (correctly — silent beats wrong). Full investigation + A/B record: `docs/benchmarks/call-sequence-analysis.md`.
+
 ### Explore budget — keep BOTH budgets monotonic with repo size
 
 Two functions in `src/mcp/tools.ts` scale explore with indexed file count. This is the expected resolution (a regression here silently forces agents back to Read):
