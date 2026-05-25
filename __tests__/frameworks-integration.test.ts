@@ -1145,6 +1145,137 @@ describe('Dagger 2 — @Provides / @Binds binding extraction', () => {
     cg.close();
   });
 
+  it('links field injection (@Inject FieldType) to the resolved impl', async () => {
+    // Activities don't have `@Inject constructor` — Dagger injects via
+    // `@Inject` fields after activity creation. Same lookup, different
+    // parse: `@Inject TypeName fieldName;` (Java) / `@Inject lateinit var
+    // name: Type` (Kotlin).
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Store.java'),
+      'package com.example;\npublic interface Store {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'StoreImpl.java'),
+      'package com.example;\npublic class StoreImpl implements Store {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'AppModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Binds;\n' +
+        '@Module public abstract class AppModule {\n' +
+        '  @Binds abstract Store bindStore(StoreImpl impl);\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'MainActivity.java'),
+      'package com.example;\nimport javax.inject.Inject;\n' +
+        'public class MainActivity {\n' +
+        '  @Inject Store store;\n' +
+        '  @Inject protected Store anotherStore;\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const act = cg.getNodesByKind('class').find((n) => n.name === 'MainActivity');
+    const impl = cg.getNodesByKind('class').find((n) => n.name === 'StoreImpl');
+    const edge = cg.getOutgoingEdges(act!.id).find(
+      (e) => e.target === impl!.id
+        && (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'dagger-inject'
+    );
+    expect(edge, 'MainActivity field injection should reach StoreImpl').toBeDefined();
+    cg.close();
+  });
+
+  it('self-binds @Inject constructor classes (no @Provides needed)', async () => {
+    // `class Foo @Inject constructor(...)` is bindable BY ITSELF — Dagger
+    // doesn't need `@Provides Foo` to inject it. So `@Inject Foo foo` in
+    // another class should reach Foo directly through self-binding.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'UserService.java'),
+      'package com.example;\nimport javax.inject.Inject;\n' +
+        'public class UserService {\n' +
+        '  @Inject public UserService() {}\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'UserController.java'),
+      'package com.example;\nimport javax.inject.Inject;\n' +
+        'public class UserController {\n' +
+        '  @Inject public UserController(UserService userService) {}\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const ctrl = cg.getNodesByKind('class').find((n) => n.name === 'UserController');
+    const svc = cg.getNodesByKind('class').find((n) => n.name === 'UserService');
+    const edge = cg.getOutgoingEdges(ctrl!.id).find(
+      (e) => e.target === svc!.id
+        && (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'dagger-inject'
+    );
+    expect(edge, 'UserController should self-bind to UserService').toBeDefined();
+    cg.close();
+  });
+
+  it('does not fan @Inject<Iface> out to all multibinding contributors', async () => {
+    // `@IntoMap` declares contributors to `Map<Class<?>, ViewModel>`; the
+    // real injection point is the map, not bare `ViewModel`. Linking
+    // every `@Inject ViewModel` (none exist in well-formed code, but
+    // false positives would be loud) to every contributor would produce
+    // a 1×N noise fan-out.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'ViewModel.java'),
+      'package com.example;\npublic interface ViewModel {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'VmA.java'),
+      'package com.example;\npublic class VmA implements ViewModel {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'VmB.java'),
+      'package com.example;\npublic class VmB implements ViewModel {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'VmModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Binds;\nimport dagger.multibindings.IntoMap;\n' +
+        '@Module public abstract class VmModule {\n' +
+        '  @Binds @IntoMap abstract ViewModel bindA(VmA impl);\n' +
+        '  @Binds @IntoMap abstract ViewModel bindB(VmB impl);\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Consumer.java'),
+      'package com.example;\nimport javax.inject.Inject;\n' +
+        'public class Consumer {\n' +
+        '  @Inject ViewModel vm;\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const consumer = cg.getNodesByKind('class').find((n) => n.name === 'Consumer');
+    const injectEdges = cg.getOutgoingEdges(consumer!.id).filter(
+      (e) => (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'dagger-inject'
+    );
+    // Bindings are emitted as binding NODES (qualifiedName carries
+    // `multibinding:` prefix), but bare-iface `@Inject ViewModel` resolves
+    // to NEITHER VmA nor VmB — Consumer has zero dagger-inject out-edges.
+    expect(injectEdges.length).toBe(0);
+
+    // The binding nodes themselves still exist (extracted), they just
+    // don't fan into @Inject lookup. Sanity-check that.
+    const bindings = cg.getNodesByKind('binding');
+    expect(bindings.find((b) => b.name === 'ViewModel->VmA')).toBeDefined();
+    expect(bindings.find((b) => b.name === 'ViewModel->VmB')).toBeDefined();
+    cg.close();
+  });
+
   it('does not emit bindings from a file with no dagger import', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
     fs.writeFileSync(
