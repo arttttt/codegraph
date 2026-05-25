@@ -1276,6 +1276,109 @@ describe('Dagger 2 — @Provides / @Binds binding extraction', () => {
     cg.close();
   });
 
+  it('disambiguates parallel bindings via @Named qualifier', async () => {
+    // Two @Binds providing the same interface, distinguished by @Named.
+    // An @Inject site with one qualifier should resolve only to its own
+    // impl, not to the other variant.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'OkHttpClient.java'),
+      'package com.example;\npublic interface OkHttpClient {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'RegularClient.java'),
+      'package com.example;\npublic class RegularClient implements OkHttpClient {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'CustomSslClient.java'),
+      'package com.example;\npublic class CustomSslClient implements OkHttpClient {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'HttpModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Binds;\nimport javax.inject.Named;\n' +
+        '@Module public abstract class HttpModule {\n' +
+        '  @Binds @Named("regular") abstract OkHttpClient bindRegular(RegularClient impl);\n' +
+        '  @Binds @Named("ssl") abstract OkHttpClient bindCustom(CustomSslClient impl);\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ApiClient.java'),
+      'package com.example;\nimport javax.inject.Inject;\nimport javax.inject.Named;\n' +
+        'public class ApiClient {\n' +
+        '  @Inject @Named("regular") OkHttpClient regular;\n' +
+        '  @Inject @Named("ssl") OkHttpClient secure;\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    // Binding nodes carry the qualifier in their name.
+    const bindings = cg.getNodesByKind('binding');
+    expect(bindings.find((b) => b.name === 'OkHttpClient@regular->RegularClient')).toBeDefined();
+    expect(bindings.find((b) => b.name === 'OkHttpClient@ssl->CustomSslClient')).toBeDefined();
+
+    // ApiClient has @Inject @Named("regular") → RegularClient AND
+    // @Inject @Named("ssl") → CustomSslClient. Both edges exist, each
+    // pointing to its own impl (binding-precise, not crosswired).
+    const api = cg.getNodesByKind('class').find((n) => n.name === 'ApiClient')!;
+    const regular = cg.getNodesByKind('class').find((n) => n.name === 'RegularClient')!;
+    const ssl = cg.getNodesByKind('class').find((n) => n.name === 'CustomSslClient')!;
+
+    const out = cg.getOutgoingEdges(api.id).filter(
+      (e) => (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'dagger-inject'
+    );
+    expect(out.find((e) => e.target === regular.id)).toBeDefined();
+    expect(out.find((e) => e.target === ssl.id)).toBeDefined();
+    // And not mismatched.
+    const regularEdge = out.find((e) => e.target === regular.id);
+    const sslEdge = out.find((e) => e.target === ssl.id);
+    expect((regularEdge!.metadata as { via?: string }).via).toBe('OkHttpClient@regular');
+    expect((sslEdge!.metadata as { via?: string }).via).toBe('OkHttpClient@ssl');
+    cg.close();
+  });
+
+  it('strict qualifier match: bare @Inject does NOT pick up a qualified-only binding', async () => {
+    // If a binding is registered ONLY for `@Named("prod")`, a bare
+    // `@Inject Foo` (no qualifier) must not resolve to it — Dagger
+    // would refuse at compile-time, so the graph shouldn't link it.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Foo.java'),
+      'package com.example;\npublic interface Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'FooImpl.java'),
+      'package com.example;\npublic class FooImpl implements Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'M.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Binds;\nimport javax.inject.Named;\n' +
+        '@Module public abstract class M {\n' +
+        '  @Binds @Named("prod") abstract Foo bind(FooImpl impl);\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Bare.java'),
+      'package com.example;\nimport javax.inject.Inject;\n' +
+        'public class Bare {\n' +
+        '  @Inject Foo foo;\n' +  // no qualifier
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const bare = cg.getNodesByKind('class').find((n) => n.name === 'Bare')!;
+    const impl = cg.getNodesByKind('class').find((n) => n.name === 'FooImpl')!;
+    const edge = cg.getOutgoingEdges(bare.id).find(
+      (e) => e.target === impl.id
+        && (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'dagger-inject'
+    );
+    expect(edge, 'bare @Inject Foo must not silently match @Named("prod") binding').toBeUndefined();
+    cg.close();
+  });
+
   it('does not emit bindings from a file with no dagger import', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
     fs.writeFileSync(
