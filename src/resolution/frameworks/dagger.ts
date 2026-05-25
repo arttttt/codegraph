@@ -11,11 +11,16 @@
  * filters them.
  */
 
-import { Node } from '../../types';
+import { Node, Edge } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import type { QueryBuilder } from '../../db/queries';
 
 const DAGGER_IMPORT_RE = /^import\s+dagger\./m;
+// `@Inject` itself lives in `javax.inject.Inject` (Dagger 2) or
+// `jakarta.inject.Inject` (newer projects). Files using `@Inject` for
+// constructor injection typically don't `import dagger.*` themselves.
+const INJECT_IMPORT_RE = /^import\s+(?:dagger|javax\.inject|jakarta\.inject)\./m;
 
 // `@Module … (class|object|abstract class) Name { … }` — match the class
 // name + body line range. Comments are stripped so a `// @Module` doesn't
@@ -111,6 +116,100 @@ function parseBindings(moduleBody: string, bodyStartLine: number, language: 'jav
     });
   }
   return out;
+}
+
+/**
+ * Post-resolution pass: for each class with an `@Inject constructor`,
+ * link the class to the impl chosen by each of its parameter types'
+ * Dagger bindings. Without this, an `@Inject Repo repo` parameter only
+ * has the existing `type_of` edge to the `Repo` *interface* — the
+ * actual impl Dagger injects at runtime is invisible to the graph.
+ *
+ * The pass consumes `binding` nodes emitted by `extract()`: each one
+ * carries the `Iface->Impl` shape in its name plus an outgoing
+ * `references` edge to the impl class. So for parameter type `Repo`,
+ * we look up bindings whose name starts with `Repo->` and follow the
+ * binding's outgoing edge to its impl.
+ */
+const INJECT_CTOR_PARAMS_RE = /@Inject\b[^;{(]*?\(([^)]*)\)/g;
+
+function parseCtorParamTypes(paramList: string, language: 'java' | 'kotlin'): string[] {
+  const out: string[] = [];
+  for (let p of paramList.split(',')) {
+    p = p.trim();
+    if (!p) continue;
+    if (language === 'kotlin') {
+      // `[val|var] [@Anno] name: Type[ = default]`
+      const m = /:\s*([\w.<>?]+)/.exec(p);
+      if (m) out.push(bareTypeName(m[1]!));
+    } else {
+      // Java: `[final] [@Anno(...)] Type name`
+      const cleaned = p.replace(/^(?:final\s+|@\w+(?:\([^)]*\))?\s+)+/g, '');
+      const m = /^([\w.<>]+)\s+\w+/.exec(cleaned);
+      if (m) out.push(bareTypeName(m[1]!));
+    }
+  }
+  return out;
+}
+
+export function daggerInjectEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  // Index binding nodes by iface name → impl node (the binding's `references` target).
+  const ifaceToImpls = new Map<string, Node[]>();
+  for (const b of queries.getNodesByKind('binding')) {
+    const arrow = b.name.indexOf('->');
+    if (arrow <= 0) continue;
+    const iface = b.name.slice(0, arrow);
+    const out = queries.getOutgoingEdges(b.id, ['references']);
+    for (const e of out) {
+      const impl = queries.getNodeById(e.target);
+      if (!impl) continue;
+      const arr = ifaceToImpls.get(iface);
+      if (arr) arr.push(impl); else ifaceToImpls.set(iface, [impl]);
+    }
+  }
+  if (ifaceToImpls.size === 0) return [];
+
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  for (const cls of queries.getNodesByKind('class')) {
+    if (cls.language !== 'java' && cls.language !== 'kotlin') continue;
+    const content = ctx.readFile(cls.filePath);
+    if (!content || !INJECT_IMPORT_RE.test(content)) continue;
+    const classBody = sliceLines(content, cls.startLine, cls.endLine);
+    if (!classBody || !/@Inject\b/.test(classBody)) continue;
+
+    INJECT_CTOR_PARAMS_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = INJECT_CTOR_PARAMS_RE.exec(classBody))) {
+      const params = parseCtorParamTypes(m[1]!, cls.language as 'java' | 'kotlin');
+      for (const paramType of params) {
+        const impls = ifaceToImpls.get(paramType);
+        if (!impls) continue;
+        for (const impl of impls) {
+          if (impl.id === cls.id) continue;
+          const key = `${cls.id}>${impl.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: cls.id,
+            target: impl.id,
+            kind: 'references',
+            line: cls.startLine,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'dagger-inject', via: paramType },
+          });
+        }
+      }
+    }
+  }
+  return edges;
+}
+
+/** Slice a 1-indexed line range out of source content. */
+function sliceLines(content: string, startLine: number, endLine: number): string | null {
+  if (!startLine || !endLine) return null;
+  return content.split('\n').slice(startLine - 1, endLine).join('\n');
 }
 
 export const daggerResolver: FrameworkResolver = {

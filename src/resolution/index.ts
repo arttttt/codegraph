@@ -18,6 +18,7 @@ import {
 } from './types';
 import { matchReference } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs } from './import-resolver';
+import { daggerInjectEdges } from './frameworks/dagger';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
@@ -792,6 +793,19 @@ export class ReferenceResolver {
     // index on it. See docs/design/callback-edge-synthesis.md.
     try {
       aggregateStats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
+    } catch {
+      // synthesis is additive and optional; ignore failures
+    }
+
+    // Dagger `@Inject constructor` → impl edges, built on top of the
+    // `binding` nodes emitted by `daggerResolver.extract`. Best-effort.
+    try {
+      const injectEdges = daggerInjectEdges(this.queries, this.context);
+      if (injectEdges.length > 0) {
+        this.queries.insertEdges(injectEdges);
+        aggregateStats.byMethod['dagger-inject'] =
+          (aggregateStats.byMethod['dagger-inject'] ?? 0) + injectEdges.length;
+      }
     } catch {
       // synthesis is additive and optional; ignore failures
     }
