@@ -17,6 +17,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Dagger 2 and Hilt dependency-injection bindings are now indexed: a `@Provides` or `@Binds` method that binds an interface to its implementation links the two, so `codegraph_callers` on an implementation now surfaces the module that provides it.
 - Dagger 2 `@Inject` constructors now link to the implementation Dagger injects at runtime, so the common Android flow from an Activity through a ViewModel to a repository implementation connects end-to-end in callers, trace, and impact.
 - Dagger 2 dependency injection now also covers `@Inject` field injection (so Activities and Fragments, which can't use constructor injection, are linked), classes that bind themselves through an `@Inject` constructor without an explicit `@Provides`/`@Binds`, and `@IntoMap`/`@IntoSet` multibindings — whose contributors are indexed without a bare `@Inject` fanning out to every one of them.
+- Dagger 2 `@Named` qualifiers are now respected, so parallel implementations of the same interface (a `@Named("regular")` versus `@Named("ssl")` client, say) resolve to the right one at each injection site, and a bare `@Inject` won't silently pick up a qualifier-only binding.
 
 ### Fixes
 
