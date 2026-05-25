@@ -1094,6 +1094,57 @@ describe('Dagger 2 — @Provides / @Binds binding extraction', () => {
     cg.close();
   });
 
+  it('links @Inject constructor to the actual impl via Dagger binding', async () => {
+    // Activity → ViewModel → Repository: ViewModel's `@Inject constructor`
+    // takes `Repository` (the interface). At runtime Dagger injects
+    // `RepositoryImpl` (the impl chosen by `@Binds`). Without this pass,
+    // the graph only has `type_of` from constructor param to the interface;
+    // with it, the class gets a `references` edge to the actual impl.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Repository.java'),
+      'package com.example;\npublic interface Repository { void load(); }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'RepositoryImpl.java'),
+      'package com.example;\nimport javax.inject.Inject;\n' +
+        'public class RepositoryImpl implements Repository {\n' +
+        '  @Inject public RepositoryImpl() {}\n' +
+        '  public void load() {}\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'AppModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Binds;\n' +
+        '@Module public abstract class AppModule {\n' +
+        '  @Binds abstract Repository bindRepository(RepositoryImpl impl);\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'MyViewModel.java'),
+      'package com.example;\nimport javax.inject.Inject;\n' +
+        'public class MyViewModel {\n' +
+        '  private final Repository repo;\n' +
+        '  @Inject public MyViewModel(Repository repo) { this.repo = repo; }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const vm = cg.getNodesByKind('class').find((n) => n.name === 'MyViewModel');
+    const impl = cg.getNodesByKind('class').find((n) => n.name === 'RepositoryImpl');
+    expect(vm).toBeDefined();
+    expect(impl).toBeDefined();
+
+    const injectEdge = cg.getOutgoingEdges(vm!.id).find(
+      (e) => e.target === impl!.id
+        && (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'dagger-inject'
+    );
+    expect(injectEdge, 'MyViewModel should reach RepositoryImpl via Dagger inject synthesis').toBeDefined();
+    cg.close();
+  });
+
   it('does not emit bindings from a file with no dagger import', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
     fs.writeFileSync(
