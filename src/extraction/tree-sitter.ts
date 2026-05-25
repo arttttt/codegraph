@@ -215,7 +215,17 @@ export class TreeSitterExtractor {
 
       // Push file node onto stack so top-level declarations get contains edges
       this.nodeStack.push(fileNode.id);
+
+      // File-level package declaration (Kotlin/Java). Creates an implicit
+      // `namespace` node wrapping every top-level declaration so their
+      // qualifiedName carries the FQN — required for cross-file import
+      // resolution on JVM languages where filename ≠ class name.
+      const packageNodeId = this.extractFilePackage(this.tree.rootNode);
+      if (packageNodeId) this.nodeStack.push(packageNodeId);
+
       this.visitNode(this.tree.rootNode);
+
+      if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -488,6 +498,33 @@ export class TreeSitterExtractor {
       if (child && types.includes(child.type)) return child;
     }
     return null;
+  }
+
+  /**
+   * Find a `packageTypes` child under the root, create a `namespace` node
+   * for it, and return its id so the caller can scope top-level
+   * declarations underneath. Returns null when no package header is
+   * present (script files, .kts without a package).
+   */
+  private extractFilePackage(rootNode: SyntaxNode): string | null {
+    const types = this.extractor?.packageTypes;
+    if (!types || types.length === 0 || !this.extractor?.extractPackage) return null;
+
+    let pkgNode: SyntaxNode | null = null;
+    for (let i = 0; i < rootNode.namedChildCount; i++) {
+      const child = rootNode.namedChild(i);
+      if (child && types.includes(child.type)) {
+        pkgNode = child;
+        break;
+      }
+    }
+    if (!pkgNode) return null;
+
+    const pkgName = this.extractor.extractPackage(pkgNode, this.source);
+    if (!pkgName) return null;
+
+    const ns = this.createNode('namespace', pkgName, pkgNode);
+    return ns?.id ?? null;
   }
 
   /**

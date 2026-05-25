@@ -814,6 +814,38 @@ public class Calculator {
     expect(methodNode).toBeDefined();
     expect(methodNode?.isStatic).toBe(true);
   });
+
+  it('wraps top-level declarations in a namespace from package_declaration', () => {
+    const code = `
+package com.example.foo;
+
+public class Bar {
+    public String greet() { return "hi"; }
+}
+`;
+    const result = extractFromSource('Bar.java', code);
+
+    const ns = result.nodes.find((n) => n.kind === 'namespace');
+    expect(ns?.name).toBe('com.example.foo');
+
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('com.example.foo::Bar');
+
+    const greet = result.nodes.find((n) => n.kind === 'method' && n.name === 'greet');
+    expect(greet?.qualifiedName).toBe('com.example.foo::Bar::greet');
+  });
+
+  it('does not wrap when no package is declared', () => {
+    const code = `
+public class Bar {
+    public String greet() { return "hi"; }
+}
+`;
+    const result = extractFromSource('Bar.java', code);
+    expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('Bar');
+  });
 });
 
 describe('C# Extraction', () => {
@@ -1172,6 +1204,54 @@ interface WebSocket {
     expect(methodNames).toContain('request');
     expect(methodNames).toContain('send');
     expect(methodNames).toContain('cancel');
+  });
+
+  it('wraps top-level declarations in a namespace from package_header', () => {
+    const code = `
+package com.example.foo
+
+class Bar {
+  fun greet(): String = "hi"
+}
+
+fun util(): Int = 42
+`;
+    const result = extractFromSource('Bar.kt', code);
+
+    const ns = result.nodes.find((n) => n.kind === 'namespace');
+    expect(ns?.name).toBe('com.example.foo');
+
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('com.example.foo::Bar');
+
+    const greet = result.nodes.find((n) => n.kind === 'method' && n.name === 'greet');
+    expect(greet?.qualifiedName).toBe('com.example.foo::Bar::greet');
+
+    const util = result.nodes.find((n) => n.kind === 'function' && n.name === 'util');
+    expect(util?.qualifiedName).toBe('com.example.foo::util');
+  });
+
+  it('handles a single-segment package', () => {
+    const code = `
+package foo
+
+class Bar
+`;
+    const result = extractFromSource('Bar.kt', code);
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('foo::Bar');
+  });
+
+  it('does not wrap when no package is declared', () => {
+    const code = `
+class Bar {
+  fun greet() = "hi"
+}
+`;
+    const result = extractFromSource('Bar.kt', code);
+    expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('Bar');
   });
 });
 
