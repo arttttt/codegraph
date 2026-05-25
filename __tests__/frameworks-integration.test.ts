@@ -908,3 +908,214 @@ describe('Go gRPC stub→impl synthesis', () => {
     }
   });
 });
+
+describe('Dagger 2 — @Provides / @Binds binding extraction', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  // Find a binding node by its display name (`Iface->Impl`).
+  const findBinding = (cg: CodeGraph, name: string) =>
+    cg.getNodesByKind('binding').find((n) => n.name === name);
+
+  // Find the resolved `references` edge from a binding node to the impl
+  // class. Returns the target node or undefined.
+  const resolvedImpl = (cg: CodeGraph, bindingName: string) => {
+    const b = findBinding(cg, bindingName);
+    if (!b) return undefined;
+    const edge = cg.getOutgoingEdges(b.id).find((e) => e.kind === 'references');
+    return edge ? cg.getNode(edge.target) : undefined;
+  };
+
+  it('emits a binding node for @Provides with identity body, resolved to the impl class', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'DataManager.java'),
+      'package com.example;\npublic interface DataManager { void load(); }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'AppDataManager.java'),
+      'package com.example;\npublic class AppDataManager implements DataManager {\n' +
+        '  public void load() {}\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'AppModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\n' +
+        '@Module\npublic class AppModule {\n' +
+        '  @Provides DataManager provideDataManager(AppDataManager impl) { return impl; }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const impl = resolvedImpl(cg, 'DataManager->AppDataManager');
+    expect(impl?.name).toBe('AppDataManager');
+    expect(impl?.kind).toBe('class');
+    cg.close();
+  });
+
+  it('emits a binding node for @Binds abstract method (no body check needed)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Foo.java'),
+      'package com.example;\npublic interface Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'FooImpl.java'),
+      'package com.example;\npublic class FooImpl implements Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'FooModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Binds;\n' +
+        '@Module\npublic abstract class FooModule {\n' +
+        '  @Binds abstract Foo bindFoo(FooImpl impl);\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(resolvedImpl(cg, 'Foo->FooImpl')?.name).toBe('FooImpl');
+    cg.close();
+  });
+
+  it('works on a Kotlin @Module class with expression-body @Provides', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Repo.kt'),
+      'package com.example\n\ninterface Repo { fun load() }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'RepoImpl.kt'),
+      'package com.example\n\nclass RepoImpl : Repo { override fun load() {} }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'RepoModule.kt'),
+      'package com.example\n\nimport dagger.Module\nimport dagger.Provides\n\n' +
+        '@Module\nclass RepoModule {\n' +
+        '  @Provides fun provideRepo(impl: RepoImpl): Repo = impl\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(resolvedImpl(cg, 'Repo->RepoImpl')?.name).toBe('RepoImpl');
+    cg.close();
+  });
+
+  it('emits separate binding nodes for two impls of the same interface across modules', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Foo.java'),
+      'package com.example;\npublic interface Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ImplA.java'),
+      'package com.example;\npublic class ImplA implements Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ImplB.java'),
+      'package com.example;\npublic class ImplB implements Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ModuleA.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\n' +
+        '@Module public class ModuleA { @Provides Foo a(ImplA impl) { return impl; } }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ModuleB.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\n' +
+        '@Module public class ModuleB { @Provides Foo b(ImplB impl) { return impl; } }\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(resolvedImpl(cg, 'Foo->ImplA')?.name).toBe('ImplA');
+    expect(resolvedImpl(cg, 'Foo->ImplB')?.name).toBe('ImplB');
+    cg.close();
+  });
+
+  it('skips a factory @Provides whose body builds via a factory call (not identity)', async () => {
+    // Real-world failure mode (seen in Plaid): @Provides Iface(Impl) signature,
+    // but body delegates to a factory. NOT a binding.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'ViewModel.java'),
+      'package com.example;\npublic class ViewModel {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ViewModelFactory.java'),
+      'package com.example;\npublic class ViewModelFactory { public ViewModel create() { return new ViewModel(); } }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'AppModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\n' +
+        '@Module public class AppModule {\n' +
+        '  @Provides ViewModel provideViewModel(ViewModelFactory factory) {\n' +
+        '    return factory.create();\n' +
+        '  }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(findBinding(cg, 'ViewModel->ViewModelFactory')).toBeUndefined();
+    cg.close();
+  });
+
+  it('does not emit bindings from a class without @Module', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Foo.java'),
+      'package com.example;\npublic interface Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'FooImpl.java'),
+      'package com.example;\npublic class FooImpl implements Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'NotAModule.java'),
+      'package com.example;\nimport dagger.Provides;\npublic class NotAModule {\n' +
+        '  @Provides Foo provide(FooImpl impl) { return impl; }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(findBinding(cg, 'Foo->FooImpl')).toBeUndefined();
+    cg.close();
+  });
+
+  it('does not emit bindings from a file with no dagger import', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Foo.java'),
+      'package com.example;\npublic interface Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'FooImpl.java'),
+      'package com.example;\npublic class FooImpl implements Foo {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'GuiceModule.java'),
+      // Same shape but no dagger import — a different DI framework's @Module.
+      'package com.example;\n' +
+        '@interface Module {}\n' +
+        '@Module public class GuiceModule { Foo provide(FooImpl impl) { return impl; } }\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(findBinding(cg, 'Foo->FooImpl')).toBeUndefined();
+    cg.close();
+  });
+});
