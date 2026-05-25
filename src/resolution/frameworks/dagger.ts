@@ -62,6 +62,13 @@ function isIdentityBody(body: string, paramName: string): boolean {
   return new RegExp(`(?:return\\s+|=\\s*)${escaped}\\s*(?:[;\\n}]|$)`).test(body);
 }
 
+// Multibinding contributors (`@IntoMap` / `@IntoSet`) share an interface
+// across many impls — the runtime injection point is `Map<K, V>` or
+// `Set<V>`, NEVER bare V. So we still emit a binding node (the
+// contribution IS a binding) but we tag it so the `@Inject` lookup
+// doesn't fan one bare-V injection out to every contributor.
+const MULTIBINDING_RE = /@(?:IntoMap|IntoSet|ElementsIntoSet)\b/;
+
 interface Parsed {
   annotation: 'Provides' | 'Binds';
   methodName: string;
@@ -72,6 +79,8 @@ interface Parsed {
   line: number;
   /** Source-text body that follows the method head (for identity check). */
   body: string;
+  /** True if the binding is `@IntoMap`/`@IntoSet` (multibinding contributor). */
+  multibinding: boolean;
 }
 
 /** Parse one Dagger module's body (between its opening `{` and its file end). */
@@ -105,6 +114,9 @@ function parseBindings(moduleBody: string, bodyStartLine: number, language: 'jav
     // `@Binds` is always pure (abstract). `@Provides` must literally return
     // the param to count as a binding — anything else is a factory.
     if (annotation === 'Provides' && !isIdentityBody(body, paramName)) continue;
+    // Multibinding contributors carry `@IntoMap`/`@IntoSet` within the
+    // captured annotation+head span.
+    const multibinding = MULTIBINDING_RE.test(m[0]);
     out.push({
       annotation,
       methodName,
@@ -113,6 +125,7 @@ function parseBindings(moduleBody: string, bodyStartLine: number, language: 'jav
       paramName,
       line: bodyStartLine + lineOf(moduleBody, m.index) - 1,
       body,
+      multibinding,
     });
   }
   return out;
@@ -131,7 +144,15 @@ function parseBindings(moduleBody: string, bodyStartLine: number, language: 'jav
  * we look up bindings whose name starts with `Repo->` and follow the
  * binding's outgoing edge to its impl.
  */
+// `@Inject` followed by a `(…)` — constructor or method injection.
 const INJECT_CTOR_PARAMS_RE = /@Inject\b[^;{(]*?\(([^)]*)\)/g;
+// `@Inject` followed by a Java field declaration — no `(`, ends at `=` or `;`.
+// Skips modifier/annotation noise between `@Inject` and the type.
+const INJECT_FIELD_JAVA_RE =
+  /@Inject\b(?:\s+(?:public|private|protected|final|transient|volatile|static|@\w+(?:\([^)]*\))?))*\s+([\w.<>]+)\s+\w+\s*[=;]/g;
+// Kotlin field/property injection — `@Inject [lateinit] var/val name: Type`.
+const INJECT_FIELD_KOTLIN_RE =
+  /@Inject\b(?:\s+@\w+(?:\([^)]*\))?)*\s+(?:lateinit\s+)?(?:var|val)\s+\w+\s*:\s*([\w.<>?]+)/g;
 
 function parseCtorParamTypes(paramList: string, language: 'java' | 'kotlin'): string[] {
   const out: string[] = [];
@@ -152,56 +173,100 @@ function parseCtorParamTypes(paramList: string, language: 'java' | 'kotlin'): st
   return out;
 }
 
+/** Pull every `@Inject` field type out of a class body. */
+function parseInjectFieldTypes(classBody: string, language: 'java' | 'kotlin'): string[] {
+  const out: string[] = [];
+  const RE = language === 'kotlin' ? INJECT_FIELD_KOTLIN_RE : INJECT_FIELD_JAVA_RE;
+  RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = RE.exec(classBody))) out.push(bareTypeName(m[1]!));
+  return out;
+}
+
+/** Does the class body contain an `@Inject` constructor (Dagger self-binds it)? */
+function hasInjectConstructor(classBody: string): boolean {
+  return /@Inject\b[^;{(]*?\(/.test(classBody);
+}
+
 export function daggerInjectEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
-  // Index binding nodes by iface name → impl node (the binding's `references` target).
+  // Index `binding` nodes by interface name → impl node. Skip multibinding
+  // contributors (`@IntoMap`/`@IntoSet`) — fanning every `@Inject ViewModel`
+  // out to all 86 ViewModel impls produces noise edges; the real injection
+  // shape for multibindings is `Map<K,V>`/`Set<V>`, not bare V.
   const ifaceToImpls = new Map<string, Node[]>();
   for (const b of queries.getNodesByKind('binding')) {
+    if (b.qualifiedName.includes('::multibinding:')) continue;
     const arrow = b.name.indexOf('->');
     if (arrow <= 0) continue;
     const iface = b.name.slice(0, arrow);
-    const out = queries.getOutgoingEdges(b.id, ['references']);
-    for (const e of out) {
+    for (const e of queries.getOutgoingEdges(b.id, ['references'])) {
       const impl = queries.getNodeById(e.target);
       if (!impl) continue;
       const arr = ifaceToImpls.get(iface);
       if (arr) arr.push(impl); else ifaceToImpls.set(iface, [impl]);
     }
   }
+
+  // First pass: any class with an `@Inject` constructor is Dagger-known and
+  // can be self-bound (`@Inject FooService foo` resolves to `FooService`
+  // directly, no `@Provides`/`@Binds` required). Add this to the lookup
+  // table BEFORE the second pass uses it.
+  const classes = queries.getNodesByKind('class').filter(
+    (c) => c.language === 'java' || c.language === 'kotlin'
+  );
+  type Scan = { cls: Node; content: string; body: string };
+  const scans: Scan[] = [];
+  for (const cls of classes) {
+    const content = ctx.readFile(cls.filePath);
+    if (!content || !INJECT_IMPORT_RE.test(content)) continue;
+    const body = sliceLines(content, cls.startLine, cls.endLine);
+    if (!body || !/@Inject\b/.test(body)) continue;
+    scans.push({ cls, content, body });
+    if (hasInjectConstructor(body)) {
+      const arr = ifaceToImpls.get(cls.name);
+      if (arr) {
+        if (!arr.some((n) => n.id === cls.id)) arr.push(cls);
+      } else {
+        ifaceToImpls.set(cls.name, [cls]);
+      }
+    }
+  }
+
   if (ifaceToImpls.size === 0) return [];
 
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  const emit = (cls: Node, paramType: string) => {
+    const impls = ifaceToImpls.get(paramType);
+    if (!impls) return;
+    for (const impl of impls) {
+      if (impl.id === cls.id) continue;
+      const key = `${cls.id}>${impl.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: cls.id,
+        target: impl.id,
+        kind: 'references',
+        line: cls.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'dagger-inject', via: paramType },
+      });
+    }
+  };
 
-  for (const cls of queries.getNodesByKind('class')) {
-    if (cls.language !== 'java' && cls.language !== 'kotlin') continue;
-    const content = ctx.readFile(cls.filePath);
-    if (!content || !INJECT_IMPORT_RE.test(content)) continue;
-    const classBody = sliceLines(content, cls.startLine, cls.endLine);
-    if (!classBody || !/@Inject\b/.test(classBody)) continue;
+  // Second pass: harvest constructor params + field types from each
+  // already-scanned class, emit edges using the lookup table.
+  for (const { cls, body } of scans) {
+    const lang = cls.language as 'java' | 'kotlin';
 
     INJECT_CTOR_PARAMS_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
-    while ((m = INJECT_CTOR_PARAMS_RE.exec(classBody))) {
-      const params = parseCtorParamTypes(m[1]!, cls.language as 'java' | 'kotlin');
-      for (const paramType of params) {
-        const impls = ifaceToImpls.get(paramType);
-        if (!impls) continue;
-        for (const impl of impls) {
-          if (impl.id === cls.id) continue;
-          const key = `${cls.id}>${impl.id}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          edges.push({
-            source: cls.id,
-            target: impl.id,
-            kind: 'references',
-            line: cls.startLine,
-            provenance: 'heuristic',
-            metadata: { synthesizedBy: 'dagger-inject', via: paramType },
-          });
-        }
-      }
+    while ((m = INJECT_CTOR_PARAMS_RE.exec(body))) {
+      for (const t of parseCtorParamTypes(m[1]!, lang)) emit(cls, t);
     }
+
+    for (const t of parseInjectFieldTypes(body, lang)) emit(cls, t);
   }
   return edges;
 }
@@ -253,18 +318,22 @@ export const daggerResolver: FrameworkResolver = {
 
       for (const p of parsed) {
         const bindingId = `dagger-binding:${filePath}:${p.line}:${p.ifaceName}->${p.implName}`;
+        const sigPrefix = `@${p.annotation}${p.multibinding ? ' @IntoMap/Set' : ''}`;
         const bindingNode: Node = {
           id: bindingId,
           kind: 'binding',
           name: `${p.ifaceName}->${p.implName}`,
-          qualifiedName: `${filePath}::binding:${p.ifaceName}->${p.implName}`,
+          // `multibinding:` prefix lets the `@Inject` lookup tell map/set
+          // contributors apart from regular interface bindings without an
+          // extra DB column.
+          qualifiedName: `${filePath}::${p.multibinding ? 'multibinding' : 'binding'}:${p.ifaceName}->${p.implName}`,
           filePath,
           startLine: p.line,
           endLine: p.line,
           startColumn: 0,
           endColumn: 0,
           language,
-          signature: `@${p.annotation} ${p.ifaceName} ${p.methodName}(${p.implName})`,
+          signature: `${sigPrefix} ${p.ifaceName} ${p.methodName}(${p.implName})`,
           updatedAt: now,
         };
         nodes.push(bindingNode);
