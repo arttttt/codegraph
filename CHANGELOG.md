@@ -9,6 +9,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Java / Kotlin imports now resolve by fully-qualified name.** Extraction
+  wraps every top-level declaration of a `.kt` / `.java` file in a `namespace`
+  node carrying the file's `package` (so a class `Bar` in
+  `package com.example.foo` is indexed with qualifiedName
+  `com.example.foo::Bar`), and `import com.example.foo.Bar` looks the target
+  up through that index — regardless of whether the class lives in `Bar.kt`,
+  `Models.kt`, or a top-level function. Disambiguates same-name classes
+  across packages (the central failure mode of the previous name-matcher
+  fallback in multi-module Spring / Android codebases), works across the
+  Java↔Kotlin interop boundary, and lays groundwork for binding-precise
+  Dagger2 / Hilt resolution. Wildcard imports (`com.example.*`) still go
+  through name-matcher.
+
 ### Fixed
 - **`codegraph index` / `init -i` summary now reports the true edge count.**
   The per-file counter in the orchestrator only saw extraction-phase edges,
