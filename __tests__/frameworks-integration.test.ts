@@ -1403,4 +1403,333 @@ describe('Dagger 2 — @Provides / @Binds binding extraction', () => {
     expect(findBinding(cg, 'Foo->FooImpl')).toBeUndefined();
     cg.close();
   });
+
+  // Factory bindings — `@Provides Iface m(...) { return new Impl(...); }` —
+  // are how a large share of real Android Dagger modules expose their impls.
+  // Identity bindings cover only the Iface(Impl)→Impl shape; factory bindings
+  // close the rest by parsing the body for top-level `new` / Kotlin `Foo()`
+  // calls and treating the constructed type as the binding target.
+
+  it('factory-binding: @Provides body `return new Impl(...)` binds Iface to Impl', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Listener.java'),
+      'package com.example;\npublic interface Listener { void on(); }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Tracker.java'),
+      'package com.example;\npublic class Tracker implements Listener {\n' +
+        '  public Tracker(String tag) {}\n  public void on() {}\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'AnalyticsModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\n' +
+        '@Module public class AnalyticsModule {\n' +
+        '  @Provides public Listener provideListener() { return new Tracker("x"); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(resolvedImpl(cg, 'Listener->Tracker')?.name).toBe('Tracker');
+    cg.close();
+  });
+
+  it('factory-binding: ternary body emits a binding for each `new` branch', async () => {
+    // Pattern from WordPress's IInAppUpdateManager — the @Provides returns
+    // either impl based on a feature-flag check. Both impls should bind.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Manager.java'),
+      'package com.example;\npublic interface Manager {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'RealManager.java'),
+      'package com.example;\npublic class RealManager implements Manager {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'NoopManager.java'),
+      'package com.example;\npublic class NoopManager implements Manager {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ManagerModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\n' +
+        '@Module public class ManagerModule {\n' +
+        '  @Provides public Manager provideManager(boolean enabled) {\n' +
+        '    return enabled ? new RealManager() : new NoopManager();\n' +
+        '  }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(resolvedImpl(cg, 'Manager->RealManager')?.name).toBe('RealManager');
+    expect(resolvedImpl(cg, 'Manager->NoopManager')?.name).toBe('NoopManager');
+    cg.close();
+  });
+
+  it('factory-binding: rejects Builder chains (`new X.Builder().build()`)', async () => {
+    // Plaid/WordPress are full of `return new SdkType.Builder().a().b().build()`.
+    // The `.build()` after the constructor's closing `)` reveals that the
+    // returned value is NOT the constructed `Builder` itself.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'OkHttpClient.java'),
+      'package com.example;\npublic class OkHttpClient {\n' +
+        '  public static class Builder { public Builder addInterceptor(Object o) { return this; } public OkHttpClient build() { return new OkHttpClient(); } }\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'HttpModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\n' +
+        '@Module public class HttpModule {\n' +
+        '  @Provides public OkHttpClient provideClient() { return new OkHttpClient.Builder().addInterceptor(null).build(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(findBinding(cg, 'OkHttpClient->Builder')).toBeUndefined();
+    cg.close();
+  });
+
+  it('factory-binding: Kotlin expression-body `= Impl()` binds Iface to Impl', async () => {
+    // From WordPress's AccountSettingsModule — `fun provideX(): ContinuationWrapper = DefaultContinuationWrapper()`.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Wrapper.kt'),
+      'package com.example\n\ninterface Wrapper { fun wrap() }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'DefaultWrapper.kt'),
+      'package com.example\n\nclass DefaultWrapper : Wrapper { override fun wrap() {} }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'WrapperModule.kt'),
+      'package com.example\n\nimport dagger.Module\nimport dagger.Provides\n\n' +
+        '@Module\nclass WrapperModule {\n' +
+        '  @Provides fun provideWrapper(): Wrapper = DefaultWrapper()\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(resolvedImpl(cg, 'Wrapper->DefaultWrapper')?.name).toBe('DefaultWrapper');
+    cg.close();
+  });
+
+  it('factory-binding: Kotlin block-body `{ return Impl() }` binds Iface to Impl', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Store.kt'),
+      'package com.example\n\ninterface Store { fun load() }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'DiskStore.kt'),
+      'package com.example\n\nclass DiskStore : Store { override fun load() {} }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'StoreModule.kt'),
+      'package com.example\n\nimport dagger.Module\nimport dagger.Provides\n\n' +
+        '@Module\nclass StoreModule {\n' +
+        '  @Provides fun provideStore(): Store {\n' +
+        '    return DiskStore()\n' +
+        '  }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(resolvedImpl(cg, 'Store->DiskStore')?.name).toBe('DiskStore');
+    cg.close();
+  });
+
+  it('factory-binding: Kotlin block body ignores `val x = Impl()` local-var assignments', async () => {
+    // Regression for a false positive on Plaid (SourcesRepositoryModule): in
+    // a block body, `val localDataSource = SourcesLocalDataSource(prefs)` is
+    // a LOCAL, not the return value. Only `return Impl()` should bind. The
+    // method here returns via a static factory call (lowercase, rejected).
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Repo.kt'),
+      'package com.example\n\ninterface Repo\nclass DataSource\nobject Repo {\n  fun getInstance(d: DataSource): Repo = throw RuntimeException()\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'RepoModule.kt'),
+      'package com.example\n\nimport dagger.Module\nimport dagger.Provides\n\n' +
+        '@Module\nclass RepoModule {\n' +
+        '  @Provides fun provideRepo(): Repo {\n' +
+        '    val local = DataSource()\n' +
+        '    return Repo.getInstance(local)\n' +
+        '  }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    // Must NOT bind `Repo->DataSource` — DataSource is a local-var construction,
+    // not the returned value.
+    expect(findBinding(cg, 'Repo->DataSource')).toBeUndefined();
+    cg.close();
+  });
+
+  it('factory-binding: Kotlin rejects lowercase callees (`Factory.create()`)', async () => {
+    // Lowercase callee = method call, not constructor. Plaid is full of these.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Client.kt'),
+      'package com.example\n\ninterface Client\nobject Factory { fun create(): Client = throw RuntimeException() }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ClientModule.kt'),
+      'package com.example\n\nimport dagger.Module\nimport dagger.Provides\n\n' +
+        '@Module\nclass ClientModule {\n' +
+        '  @Provides fun provideClient(): Client = Factory.create()\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(cg.getNodesByKind('binding').filter((n) => n.name.startsWith('Client->'))).toEqual([]);
+    cg.close();
+  });
+
+  it('factory-binding: zero-param @Provides binds (no identity-param needed)', async () => {
+    // Common shape: `@Provides public X provide() { return new XImpl(); }` — no
+    // params at all. The identity-binding regex used to skip these.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Strategy.java'),
+      'package com.example;\npublic interface Strategy {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'VoiceStrategy.java'),
+      'package com.example;\npublic class VoiceStrategy implements Strategy {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'StrategyModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\n' +
+        '@Module public class StrategyModule {\n' +
+        '  @Provides public static Strategy provideStrategy() { return new VoiceStrategy(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(resolvedImpl(cg, 'Strategy->VoiceStrategy')?.name).toBe('VoiceStrategy');
+    cg.close();
+  });
+
+  it('factory-binding: generic constructor (`new Impl<T>()`) strips type params', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Holder.java'),
+      'package com.example;\npublic interface Holder<T> {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'StringHolder.java'),
+      'package com.example;\npublic class StringHolder<T> implements Holder<T> {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'HolderModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\n' +
+        '@Module public class HolderModule {\n' +
+        '  @Provides public Holder<String> provide() { return new StringHolder<String>(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(resolvedImpl(cg, 'Holder->StringHolder')?.name).toBe('StringHolder');
+    cg.close();
+  });
+
+  it('factory-binding: ignores @Named on params (qualifier belongs to the @Provides, not its args)', async () => {
+    // Regression for a WordPress false positive (IInAppUpdateManager): the
+    // binding has NO @Named on @Provides itself, but its first param does:
+    // `@Named(APPLICATION_SCOPE) CoroutineScope appScope`. That qualifier
+    // applies to the param's injection site, not to this binding.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Manager.java'),
+      'package com.example;\npublic interface Manager {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ManagerImpl.java'),
+      'package com.example;\npublic class ManagerImpl implements Manager {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Scope.java'),
+      'package com.example;\npublic class Scope {}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ManagerModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\nimport javax.inject.Named;\n' +
+        '@Module public class ManagerModule {\n' +
+        '  @Provides public Manager provideManager(@Named("app") Scope scope) { return new ManagerImpl(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    // Should bind under the unqualified key, NOT `Manager@app->ManagerImpl`.
+    expect(findBinding(cg, 'Manager->ManagerImpl')).toBeDefined();
+    expect(findBinding(cg, 'Manager@app->ManagerImpl')).toBeUndefined();
+    cg.close();
+  });
+
+  it('factory-binding: factory bindings feed @Inject lookup like identity ones', async () => {
+    // End-to-end check: the inject pass should follow a factory binding's
+    // `references` edge into the impl the same way it follows an identity
+    // binding's. Without this, factory bindings would only enrich `getCallers`
+    // but not `getCallees` from @Inject sites — defeating the point.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dagger-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Service.java'),
+      'package com.example;\npublic interface Service { void run(); }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ServiceImpl.java'),
+      'package com.example;\npublic class ServiceImpl implements Service { public void run() {} }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ServiceModule.java'),
+      'package com.example;\nimport dagger.Module;\nimport dagger.Provides;\n' +
+        '@Module public class ServiceModule {\n' +
+        '  @Provides public Service provideService() { return new ServiceImpl(); }\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Caller.java'),
+      'package com.example;\nimport javax.inject.Inject;\n' +
+        'public class Caller {\n' +
+        '  private final Service svc;\n' +
+        '  @Inject public Caller(Service svc) { this.svc = svc; }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const caller = cg.getNodesByKind('class').find((n) => n.name === 'Caller');
+    const impl = cg.getNodesByKind('class').find((n) => n.name === 'ServiceImpl');
+    expect(caller).toBeDefined();
+    expect(impl).toBeDefined();
+    const link = cg.getOutgoingEdges(caller!.id).find(
+      (e) => e.target === impl!.id && (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'dagger-inject'
+    );
+    expect(link).toBeDefined();
+    cg.close();
+  });
 });
