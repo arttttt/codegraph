@@ -30,11 +30,14 @@ const MODULE_CLASS_RE =
 
 // `@Provides` / `@Binds` followed by the method head. Allows extra
 // annotations/modifiers between annotation and signature. Two heads —
-// Java (return-type-first) and Kotlin (`fun`-first).
+// Java (return-type-first) and Kotlin (`fun`-first). The lazy `[\s\S]*?`
+// inside `(...)` allows nested `@Anno(...)` annotations on params; the
+// trailing `\)\s*[;{]` (Java) / `\)\s*:` (Kotlin) disambiguates the
+// method's closing `)` from any annotation `)`.
 const JAVA_BINDING_RE =
-  /@(Provides|Binds)\b[\s\S]*?(?:public|private|protected|abstract|static|final|default|\s)*\b([\w.<>]+)\s+(\w+)\s*\(\s*(?:@\w+(?:\([^)]*\))?\s+)?([\w.<>]+)\s+(\w+)\s*[,)]/g;
+  /@(Provides|Binds)\b[\s\S]*?(?:public|private|protected|abstract|static|final|default|\s)*\b([\w.<>]+)\s+(\w+)\s*\(([\s\S]*?)\)\s*[;{]/g;
 const KOTLIN_BINDING_RE =
-  /@(Provides|Binds)\b[\s\S]*?\bfun\s+(\w+)\s*\(\s*(\w+)\s*:\s*([\w.<>?]+)[\s\S]*?\)\s*:\s*([\w.<>?]+)/g;
+  /@(Provides|Binds)\b[\s\S]*?\bfun\s+(\w+)\s*\(([\s\S]*?)\)\s*:\s*([\w.<>?]+)/g;
 
 /** Strip generics and dotted qualifiers down to the bare type name. */
 function bareTypeName(t: string): string {
@@ -46,20 +49,170 @@ function lineOf(text: string, index: number): number {
   return text.slice(0, index).split('\n').length;
 }
 
-/** Find the body that immediately follows the method head ending at `headEndIdx`. */
-function bodyAfter(text: string, headEndIdx: number): string {
-  // For Java: `{ … }`; for Kotlin: either `{ … }` or `= expr`. Read up to
-  // the first balanced `}` or, for expression bodies, up to the end of the
-  // following statement (newline / `}` / EOF). Conservative — we just need
-  // to see whether the body literally returns the param.
-  const slice = text.slice(headEndIdx, headEndIdx + 400);
-  return slice;
+/** Walk to the `}` that closes the `{` at `openIdx`. Returns -1 if unbalanced. */
+function findMatchingBrace(text: string, openIdx: number): number {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    const c = text[i];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Return the body of the binding method whose head match ends at `headEndIdx`.
+ * Clamped to the method's own braces — without this, a 1500-char fixed window
+ * bleeds into the NEXT method's body and a `new X(...)` there gets attributed
+ * to the wrong binding's iface (real bug seen on janishar: `provideBlogAdapter`'s
+ * window reached into `provideLinearLayoutManager` and emitted `BlogAdapter->LinearLayoutManager`).
+ *
+ * Java head match ends AT `{` or `;` (abstract @Binds). Kotlin head ends at
+ * the return type; the body that follows is `= expr` (expression body) or
+ * `{ block }`.
+ */
+function bodyOf(text: string, headEndIdx: number, language: 'java' | 'kotlin'): string {
+  if (language === 'java') {
+    if (text[headEndIdx - 1] !== '{') return '';
+    const closeIdx = findMatchingBrace(text, headEndIdx - 1);
+    if (closeIdx < 0) return text.slice(headEndIdx, headEndIdx + 1500);
+    return text.slice(headEndIdx, closeIdx);
+  }
+  let i = headEndIdx;
+  while (i < text.length && /\s/.test(text[i]!)) i++;
+  if (text[i] === '{') {
+    const closeIdx = findMatchingBrace(text, i);
+    if (closeIdx < 0) return text.slice(i + 1, i + 1 + 1500);
+    return text.slice(i + 1, closeIdx);
+  }
+  if (text[i] === '=') {
+    let j = i + 1;
+    let depth = 0;
+    while (j < text.length) {
+      const c = text[j]!;
+      if (c === '(' || c === '{' || c === '[') depth++;
+      else if (c === ')' || c === '}' || c === ']') {
+        if (depth === 0) break;
+        depth--;
+      } else if (depth === 0 && c === '\n') break;
+      j++;
+    }
+    // Include the leading `=` so identity/factory regexes can anchor on it.
+    return text.slice(i, j);
+  }
+  return '';
 }
 
 /** Does the body look like `return paramName;` (Java) or `= paramName` / `return paramName` (Kotlin)? */
 function isIdentityBody(body: string, paramName: string): boolean {
+  if (!paramName) return false;
   const escaped = paramName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`(?:return\\s+|=\\s*)${escaped}\\s*(?:[;\\n}]|$)`).test(body);
+}
+
+/** Walk to the `)` that closes the `(` at `openIdx`. Returns -1 if unbalanced or truncated. */
+function findMatchingParen(text: string, openIdx: number): number {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    const c = text[i];
+    if (c === '(') depth++;
+    else if (c === ')') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+// `return new Impl(...)` (Java) — covers ternary alternates too (`?` / `:`
+// before `new` instead of `return`).
+const JAVA_FACTORY_NEW_RE =
+  /(?:\breturn\b|[?:])\s*new\s+([\w.]+(?:<[^<>]*>)?)\s*\(/g;
+// Kotlin block-body return: `return Impl(...)` only. Local-var assignments
+// (`val x = Impl(...)`) also start with `=`, so the `=` anchor would
+// false-positive any locally constructed value inside a block body — bug
+// seen on Plaid's `SourcesRepositoryModule`.
+const KOTLIN_FACTORY_RETURN_RE =
+  /(?:\breturn\b|[?:])\s*([A-Z][\w.]*(?:<[^<>]*>)?)\s*\(/g;
+// Kotlin expression-body: `= Impl(...)` at body start (the `=` is included
+// in the body slice for expression-body methods; see `bodyOf`).
+const KOTLIN_FACTORY_EXPR_RE =
+  /^\s*=\s*([A-Z][\w.]*(?:<[^<>]*>)?)\s*\(/;
+
+/**
+ * Find Iface→Impl factory bindings inside a `@Provides` body. Returns the bare
+ * names of types whose constructor sits in tail-return position. Skips:
+ *  - Builder chains (`new X().build()`, `X().build()`) — the `.method` after
+ *    the closing `)` reveals the value is not the constructed `X` itself.
+ *  - Lowercase callees (`Factory.create()`, `foo.bar()`) — those are static or
+ *    instance method calls, not constructors.
+ *  - The interface itself (caller already filters `ifaceName === implName`).
+ *  - Local-var assignments in Kotlin block bodies (only `return Impl()` is
+ *    treated as the binding target there; expression bodies match a SEPARATE
+ *    anchor `^=` since the entire body IS the return).
+ */
+function extractFactoryImpls(body: string, language: 'java' | 'kotlin', ifaceName: string): string[] {
+  const impls: string[] = [];
+  const seen = new Set<string>();
+
+  const tryEmit = (raw: string, openParenIdx: number): void => {
+    const closeParenIdx = findMatchingParen(body, openParenIdx);
+    if (closeParenIdx < 0) return;
+    let i = closeParenIdx + 1;
+    while (i < body.length && /\s/.test(body[i]!)) i++;
+    if (body[i] === '.') return;
+    const bare = bareTypeName(raw);
+    if (!bare || bare === ifaceName) return;
+    if (!/^[A-Z]/.test(bare)) return;
+    if (seen.has(bare)) return;
+    seen.add(bare);
+    impls.push(bare);
+  };
+
+  if (language === 'java') {
+    JAVA_FACTORY_NEW_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = JAVA_FACTORY_NEW_RE.exec(body))) {
+      tryEmit(m[1]!, m.index + m[0].length - 1);
+    }
+    return impls;
+  }
+
+  // Kotlin: try expression-body first (only matches if body starts with `=`).
+  const exprMatch = KOTLIN_FACTORY_EXPR_RE.exec(body);
+  if (exprMatch) {
+    tryEmit(exprMatch[1]!, exprMatch.index + exprMatch[0].length - 1);
+    return impls;
+  }
+  KOTLIN_FACTORY_RETURN_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = KOTLIN_FACTORY_RETURN_RE.exec(body))) {
+    tryEmit(m[1]!, m.index + m[0].length - 1);
+  }
+  return impls;
+}
+
+/** Pull the first param's type and name out of a captured param list. */
+function parseFirstParam(paramList: string, language: 'java' | 'kotlin'): { type: string; name: string } | null {
+  const trimmed = paramList.trim();
+  if (!trimmed) return null;
+  // Split on top-level commas only — annotation args like `@Named("a,b")` would
+  // break a naive split, but the substring up to the first `,` is good enough
+  // here since binding param annotations rarely contain commas.
+  const first = trimmed.split(',')[0]!.trim();
+  if (!first) return null;
+  if (language === 'kotlin') {
+    const m = /(?:(?:val|var)\s+)?(?:@\w+(?:\([^)]*\))?\s+)*(\w+)\s*:\s*([\w.<>?]+)/.exec(first);
+    if (m) return { type: bareTypeName(m[2]!), name: m[1]! };
+  } else {
+    const cleaned = first.replace(/^(?:final\s+|@\w+(?:\([^)]*\))?\s+)+/g, '');
+    const m = /^([\w.<>]+)\s+(\w+)/.exec(cleaned);
+    if (m) return { type: bareTypeName(m[1]!), name: m[2]! };
+  }
+  return null;
 }
 
 // Multibinding contributors (`@IntoMap` / `@IntoSet`) share an interface
@@ -88,6 +241,10 @@ interface Parsed {
   multibinding: boolean;
   /** `@Named` qualifier value (raw — quote-stripped), or empty string. */
   qualifier: string;
+  /** True if `implName` was extracted from a factory body (`return new Impl()`),
+   *  not from an identity body (`return param`). Same lookup behavior, but the
+   *  `signature` reflects the distinction so audits can spot factory bindings. */
+  factory: boolean;
 }
 
 /** Build the lookup key for the iface→impls map, optionally with a qualifier. */
@@ -110,27 +267,24 @@ function parseBindings(moduleBody: string, bodyStartLine: number, language: 'jav
     const annotation = m[1] as 'Provides' | 'Binds';
     let methodName: string;
     let ifaceName: string;
-    let implName: string;
-    let paramName: string;
+    let paramList: string;
     if (language === 'kotlin') {
-      // groups: 1=anno, 2=methodName, 3=paramName, 4=paramType, 5=returnType
+      // groups: 1=anno, 2=methodName, 3=paramList, 4=returnType
       methodName = m[2]!;
-      paramName = m[3]!;
-      implName = bareTypeName(m[4]!);
-      ifaceName = bareTypeName(m[5]!);
+      paramList = m[3]!;
+      ifaceName = bareTypeName(m[4]!);
     } else {
-      // groups: 1=anno, 2=returnType, 3=methodName, 4=paramType, 5=paramName
+      // groups: 1=anno, 2=returnType, 3=methodName, 4=paramList
       ifaceName = bareTypeName(m[2]!);
       methodName = m[3]!;
-      implName = bareTypeName(m[4]!);
-      paramName = m[5]!;
+      paramList = m[4]!;
     }
-    if (!ifaceName || !implName || ifaceName === implName) continue;
+    if (!ifaceName) continue;
+    const firstParam = parseFirstParam(paramList, language);
+
     const headEndIdx = m.index + m[0].length;
-    const body = bodyAfter(moduleBody, headEndIdx);
-    // `@Binds` is always pure (abstract). `@Provides` must literally return
-    // the param to count as a binding — anything else is a factory.
-    if (annotation === 'Provides' && !isIdentityBody(body, paramName)) continue;
+    const body = bodyOf(moduleBody, headEndIdx, language);
+
     // Annotations adjacent to a binding can sit BEFORE or AFTER
     // `@Provides`/`@Binds`. The match span starts AT `@Provides`/`@Binds`,
     // so multibinding / qualifier annotations placed above (the common
@@ -140,21 +294,40 @@ function parseBindings(moduleBody: string, bodyStartLine: number, language: 'jav
     let lookback = moduleBody.slice(Math.max(0, m.index - 240), m.index);
     const lastEnd = Math.max(lookback.lastIndexOf(';'), lookback.lastIndexOf('}'));
     if (lastEnd >= 0) lookback = lookback.slice(lastEnd + 1);
-    const annoSpan = lookback + m[0];
+    // Restrict qualifier/multibinding scan to BEFORE the param list — a
+    // `@Named` on a *parameter* applies to that param's injection point,
+    // NOT to the binding itself (WordPress's `IInAppUpdateManager` mistakenly
+    // picked up its first param's `@Named(APPLICATION_SCOPE)`). The method's
+    // `(` follows the method name; `indexOf('(')` alone is wrong because an
+    // annotation like `@Named("regular")` introduces an earlier `(`.
+    const nameIdx = m[0].lastIndexOf(methodName);
+    const paramOpen = nameIdx >= 0 ? m[0].indexOf('(', nameIdx) : m[0].indexOf('(');
+    const headOnly = paramOpen >= 0 ? m[0].slice(0, paramOpen) : m[0];
+    const annoSpan = lookback + headOnly;
     const multibinding = MULTIBINDING_RE.test(annoSpan);
     const qm = NAMED_QUALIFIER_RE.exec(annoSpan);
     const qualifier = qm ? normalizeQualifier(qm[1]!) : '';
-    out.push({
-      annotation,
-      methodName,
-      ifaceName,
-      implName,
-      paramName,
-      line: bodyStartLine + lineOf(moduleBody, m.index) - 1,
-      body,
-      multibinding,
-      qualifier,
-    });
+    const line = bodyStartLine + lineOf(moduleBody, m.index) - 1;
+    const common = { annotation, methodName, ifaceName, line, body, multibinding, qualifier };
+
+    // `@Binds` is abstract by definition — the first param's type IS the impl.
+    if (annotation === 'Binds') {
+      if (!firstParam || !firstParam.type || firstParam.type === ifaceName) continue;
+      out.push({ ...common, implName: firstParam.type, paramName: firstParam.name, factory: false });
+      continue;
+    }
+
+    // `@Provides` identity body: `return paramName` (Java) or `= paramName` (Kotlin).
+    if (firstParam && firstParam.type && firstParam.type !== ifaceName && isIdentityBody(body, firstParam.name)) {
+      out.push({ ...common, implName: firstParam.type, paramName: firstParam.name, factory: false });
+      continue;
+    }
+
+    // `@Provides` factory body: `return new Impl(...)` (Java) / `= Impl()` (Kotlin),
+    // possibly multiple impls in a ternary.
+    for (const impl of extractFactoryImpls(body, language, ifaceName)) {
+      out.push({ ...common, implName: impl, paramName: '', factory: true });
+    }
   }
   return out;
 }
@@ -365,7 +538,7 @@ export const daggerResolver: FrameworkResolver = {
       for (const p of parsed) {
         const qSuffix = p.qualifier ? `@${p.qualifier}` : '';
         const bindingId = `dagger-binding:${filePath}:${p.line}:${p.ifaceName}${qSuffix}->${p.implName}`;
-        const sigPrefix = `@${p.annotation}${p.multibinding ? ' @IntoMap/Set' : ''}${p.qualifier ? ' @Named(' + p.qualifier + ')' : ''}`;
+        const sigPrefix = `@${p.annotation}${p.factory ? ' (factory)' : ''}${p.multibinding ? ' @IntoMap/Set' : ''}${p.qualifier ? ' @Named(' + p.qualifier + ')' : ''}`;
         const bindingNode: Node = {
           id: bindingId,
           kind: 'binding',
