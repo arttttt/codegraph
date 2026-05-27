@@ -22,6 +22,21 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Java↔Kotlin interop boundary, and lays groundwork for binding-precise
   Dagger2 / Hilt resolution. Wildcard imports (`com.example.*`) still go
   through name-matcher.
+- **Java / C# anonymous classes (`new T() { ... }`) are now extracted as
+  first-class class nodes with their overrides.** Previously, an anonymous
+  subclass returned from a factory or lambda — `return new BaseIter() {
+  @Override int separatorStart(int s) { ... } };` — produced only an
+  `instantiates` edge: the override methods were invisible to the graph and
+  Phase 5.5 interface-impl synthesis had no class to bridge. The anon class
+  now lands as `<TypeName$anon@line>` with an `extends` reference to the
+  named base/interface, scoped under the enclosing method, and its
+  `method_declaration` members become normal method nodes. The interface→impl
+  synthesizer then bridges the base's abstract methods to the anonymous
+  overrides automatically. Concrete effect on `google/guava` (3,227 .java
+  files): 3,608 anonymous classes extracted, +2,534 interface-impl edges
+  reach overrides hidden in `new T() { ... }` blocks (including lambda
+  bodies). An agent investigating `Splitter.SplittingIterator.separatorStart`
+  now sees the four anonymous overrides in its trail without a Read.
 
 ### Fixed
 - **`codegraph index` / `init -i` summary now reports the true edge count.**
