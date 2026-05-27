@@ -959,7 +959,7 @@ public class Handler {
 
       const use = cg
         .getNodesByKind('method')
-        .find((n) => n.qualifiedName === 'Handler::use');
+        .find((n) => n.qualifiedName === 'com.example.web::Handler::use');
       expect(use).toBeDefined();
       const calls = cg.getOutgoingEdges(use!.id).filter((e) => e.kind === 'calls');
       expect(calls.length).toBeGreaterThanOrEqual(1);
